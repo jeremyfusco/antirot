@@ -1,0 +1,381 @@
+#!/usr/bin/env perl
+#
+# Jeremy Fusco -- 2014. 
+
+use Getopt::Long;
+use Pod::Usage;
+use Switch;                     # Todo: Removed in version 5.014. Will require refactor.
+use Cwd qw(abs_path cwd);
+use File::Basename;
+# use Fusco::Lock -- Defined inline.
+
+my $lock;  # Fusco::Lock object to prevent a race condition.
+
+########## DEFAULT OPTIONS #####################################################
+my %options = (
+    var     => '/var/tmp/', # Persists between reboots. 
+    age     => '7d',
+    lockdir => '/tmp/',     # Not using /var/run intentionally as we may want to run as a non root user.
+    path    => cwd()
+);
+
+{ ######## GET OPTIONS FROM COMMAND LINE #######################################
+    GetOptions(\%options, 
+        'var:s',
+        'path=s',
+        'age:s'
+    ) or pod2usage(2);
+}
+
+{ ######## PROVIDE HELP TO THE USER#############################################
+
+    my  $help = my  $man = 0;
+    GetOptions('help|?' => \$help, man => \$man);
+    pod2usage(1) if $help;
+    pod2usage(-exitval => 0, -verbose => 2) if $man;
+}
+
+
+{ ######## CONVERT TIME TO SECONDS #############################################
+    $options{age} = convert_to_seconds($options{age});
+}
+
+
+
+{ ######## VERIFY THE DIRECTORY PATH ###########################################
+    $options{path} = verify_path($options{path}) // 
+        die("$options{path} is either invalid or you do not have permissions to read the contents");
+}
+
+{ ######## CREATE A LOCKFILE OR DIE ############################################
+    my $lockfile = abs_path("$options{lockdir}/" . basename($0) . '.lock');
+    $lock = Fusco::Lock->new($lockfile);
+    $lock->get_lock() or die($lock->get_error) or die($lock->get_error);
+}
+
+sleep 10;
+
+{ ######## UNLOCK AND EXIT CLEANLY #############################################
+    $lock->unlock();
+    exit(0);
+}
+
+
+
+#validate options{var}.
+## Is the var directory valid?
+## Was there a prior run against the specified path?
+
+# ${var}/antirot/ exists and is writeable.
+# Path exists and is a directory and we have a filehandle to it.
+
+sub convert_to_seconds {
+    my $user_time = lc(shift); # 'i' option to regex does not work when utilizing [] so we must convert here. 
+
+    my %time_factor = (
+        s => 1,    # This is in case a user specifies raw seconds on the command line, effectively no factor.
+        m => 60,
+        h => 3600,
+        d => 86400,
+        y => 31536000
+    );
+
+    my $time;
+    my $factor;
+    {   
+        my $valid_factors = join('|', (keys %time_factor));
+        $user_time =~ m/^(\d*)([$valid_factors]{0,1})$/;
+        $time   = $1;
+        unless($2) {
+            die("Unknown time specified $user_time. Please specify one of $valid_factors");
+        }
+        $factor = $2;
+    }
+    return ($time_factor{$factor} * $time);
+}
+
+sub verify_path {
+    my $path_to_verify = shift;
+
+    # Clean up the path. We need a consistent path for our indexing.
+    
+
+    # cd to the path in question or fail.
+    my $verified_path;
+    {
+        $verified_path = abs_path($path_to_verify) or undef;
+        my $original_pwd = cwd();
+        chdir($verified_path) or return undef;
+        chdir($original_pwd);
+    }
+    return $verified_path;
+    
+}
+
+
+package Fusco::Lock;
+
+=head1 Fusco::Lock
+
+
+=head2 PURPOSE
+
+Instantiate and populate the lock file to be used by this class.           |
+The lockfile is updated at an interval specified by the object at start up.
+
+We employ a simple check:
+    'has pid file been modified in the last interval * 1.5? 
+        yes -> exit
+        no  -> lock and update file every interval
+        
+This avoids managing filesystem locks that may not work if you chose an nfs 
+filesystem which makes fencing between distributed systems easy.
+
+Any other instances that try to instantiate a lock will not be successful 
+unless the file hasn't been updated for a grace period which is 
+interval * 1.5.
+
+This approach was chosen primarily to avoid complicated validation logic 
+employed by most locking mechanisms. That is to say, to avoid this process:
+
+'load pid file' -> 
+    newer then runtime of server? -> 
+        process still alive? kill(0, ps? ( call external program ) -> 
+            parse ps output.
+    
+The above is a simplification, there are actually more steps we are avoiding.
+
+=head2 IMPLEMENTATION
+
+Each lockfile object is responsible for maintaining a single lock file.
+
+Each lockfile instance forks itself and monitors the parent.
+If the parent dies, the lockfile instances will remove their lockfile and exit.
+
+The parent may call the $lock->unlock method to free the lock for finer grained
+control over distributed tasks.
+
+=cut
+
+=head2 new
+
+$lock = Fusco::Lock->new('/complete/path/to/lockfile');
+
+Each $lock object is responsible for one lock file.
+
+=cut
+
+
+sub new {
+   my $class    = shift;
+   my $lockfile = shift;
+
+   my %self = (
+    lockfile  => $lockfile,
+    heartbeat => 60       # Polling interval in seconds.
+   );
+
+    return bless \%self, $class;
+}
+
+=head2 get_lock
+
+Gets the lock file and forks, creating a heartbeat which updates the file every N seconds.
+
+No Signal handlers have been installed for two reasons.
+ 1. Grace period is in effect for programs that have been terminated prematuraly
+    via ctrl-c.
+ 2. I don't like how perl handles signal handlers with inline packages. 
+    ( multiple inline packages may be declared in this script going forward. )
+
+=cut
+
+sub get_lock {
+    my $self     = shift;
+    my $lockfile = $$self{lockfile};
+    my $grace    = $$self{heartbeat} * 1.5;
+
+    my $pid;
+
+    if(-e $lockfile) {
+        my @lockfile_stat = lstat($lockfile) or return _return_error($!);
+
+        if(@lockfile_stat) {
+            my $time = time;
+            if($time > ($lockfile_stat[9] + $grace)) {
+              $pid = $self->read_pid_from_file($lockfile) or die($self->get_error);
+            }
+            else {
+                return $self->_return_error("$lockfile is/was active! Grace period is $grace seconds.");
+            }
+        }
+    }
+
+    # If we are here, we have the $pid or null. In either case. We can overwrite the file as the 
+    # grace period has passed.
+              
+    $self->write_pid_to_file($lockfile) // die($self->get_error);
+    $$self{parent_pid} = $$;
+
+    return $$self{child_pid} if $$self{child_pid} = fork;
+
+    # If we are here, we are child. maintain_heartbeat executes forever.
+    $self->maintain_heartbeat;
+    exit;  # Exit just in case maintain_heartbeat passes back to us.
+}
+
+=head2 maintain_heartbeat()
+
+This method is responsible for keeping the lockfiles modification timestamp
+within the graceperiod of heartbeat * 1.5. 
+
+It will exit if the parent dies.
+
+=cut
+
+sub maintain_heartbeat {
+    my $self = shift;
+    my $lockfile = $$self{lockfile};
+    
+    my $heartbeat = $$self{heartbeat} || 5;
+    
+    #
+    
+    do {
+        unless($$self{parent_pid} eq getppid) { # If parent goes away without calling unlock();
+            $self->unlock;
+            return undef;
+        }
+        utime(undef, undef, $lockfile);
+        sleep $heartbeat;    
+    }while(1);
+}
+
+
+=head2 unlock()
+
+Kills the process responsible for maintaining the lockfile and removes the lockfile.
+
+=cut
+
+sub unlock {
+    my $self = shift;
+
+    kill(15, $$self{child_pid});
+    unlink($$self{lockfile}) // return _return_error("Could not unlink $$self{lockfile}: $!");
+    return 1;
+}
+
+=head2 read_pid_from_file()
+
+Reads the pid of the parent process from the lockfile.
+
+=cut
+
+sub read_pid_from_file {
+    my $self = shift;
+    my $lockfile = shift;
+        
+    open(LOCKFILE, "<$lockfile") or $self->_return_error("Can't read contents of $lockfile: $!");
+    my $pid = <LOCKFILE>;
+    close(LOCKFILE);
+    
+   my $pid = $pid || 'null';
+    
+    return $pid;
+}
+
+=head2 write_pid_to_file()
+
+Writes pid to the lockfile.
+
+=cut
+
+sub write_pid_to_file {
+    my $self = shift;
+    my $lockfile = shift;
+    
+    my $pid = $$;
+        
+    open(LOCKFILE, ">$lockfile") or return $self->_return_error("Can't write to $lockfile: $!");
+    print LOCKFILE $pid;
+    close(LOCKFILE);
+    
+    return 1;
+}
+
+=head2 get_error()
+
+Get the error that was set by _return_error and clear the error.
+
+=cut
+
+
+sub get_error {
+    my $self = shift;
+
+    my $error = $$self{error};
+    delete $$self{error};
+
+    return $error;
+}
+
+=head2 _return_error()
+
+Set an error and return undef.
+
+=cut
+
+sub _return_error {
+    my $self       = shift;
+    $self->{error} = shift;
+
+    return undef;
+}
+
+1;
+
+
+
+__END__
+
+=head1 NAME
+
+antirot - Detecting bitrot before it bit[e]s you.
+
+This script is intended to run on a set of servers at an interval wide enough to
+detect bitrot on filesystems that don't support checksuming.
+
+This includes Linux raid5 implementations which only utilize parity on writes and 
+rebuilds. Otherwise, all reads come from the raw data sans parity.
+
+This is be superfluous on raid1 implementations and is discouraged.
+
+This script utilizes only core Perl modules of 5.8. Perl 5.8 is one of
+the oldest perl versions still in production today so I believe it is the best
+common denominator. 
+
+=head1 SYNOPSIS
+
+antirot [options]
+
+    Options:
+     --path         default: $PWD, ex: /, /home/fusco, /etc
+     --var          default: /var/tmp/antirot/   
+     --age          default: '7d'                                                          
+              
+--path
+ 
+    path to scan for bitrot. Must be an absolute path.
+
+--var   
+
+    Path to your systems nonvolitile tmp space.
+    Note: If your intervals are greater then 29 days, you need to choose an alternate directory.
+
+--age 
+
+    Files to verify must be at least N[s|m|h|d|y] old. ex: 30s, 20m, 6h, 2d, 1y
+    All younger files will be skipped.
+
+=cut

@@ -7,13 +7,15 @@ use Pod::Usage;
 use Switch;                     # Todo: Removed in version 5.014. Will require refactor.
 use Cwd qw(abs_path cwd);
 use File::Basename;
-# use Fusco::Lock -- Defined inline.
+
+# use Fusco::Lock     -- Defined inline.
+# use Fusco::Checksum -- Defined inline.
 
 my $lock;  # Fusco::Lock object to prevent a race condition.
 
 ########## DEFAULT OPTIONS #####################################################
 my %options = (
-    var     => '/var/tmp/', # Persists between reboots. 
+    var     => '/var/tmp/antirot', # Persists between reboots. 
     age     => '7d',
     lockdir => '/tmp/',     # Not using /var/run intentionally as we may want to run as a non root user.
     path    => cwd()
@@ -35,12 +37,9 @@ my %options = (
     pod2usage(-exitval => 0, -verbose => 2) if $man;
 }
 
-
 { ######## CONVERT TIME TO SECONDS #############################################
     $options{age} = convert_to_seconds($options{age});
 }
-
-
 
 { ######## VERIFY THE DIRECTORY PATH ###########################################
     $options{path} = verify_path($options{path}) // 
@@ -53,21 +52,50 @@ my %options = (
     $lock->get_lock() or die($lock->get_error) or die($lock->get_error);
 }
 
-sleep 10;
+{ ######## CLEANUP $options{var} AND VERIFY WE CAN WRITE TO WORKDIR.
+    my $antirot_dir = abs_path("$options{var}");
+    
+    print " ## $antirot_dir ## \n ";
+    
+    unless(-e $antirot_dir) {
+        mkdir $antirot_dir;
+    }
+    
+    unless(-w $antirot_dir) {
+        die("Cannot write to $antirot_dir\n");
+    }
+    $options{var} = $antirot_dir;
+}
+
+my $verify = Fusco::Checksum->new({
+        path => $options{path}, 
+        age  => $options{age},
+        var  => $options{var} . "/md5"
+    });
+
+$verify->scan // die($verify->get_error);
+
+my @differing_files = $verify->mismatched_checksum;
+
+if($differing_files[0] = 'no mismatch') {
+    print "No mismatched checksums discovered\n";
+}
+else {
+    print "The following file(s) appear to be corrupt: \n";
+    for (@differing_files) {
+        print ;
+        print "\n";
+    }
+}
+
+
+
 
 { ######## UNLOCK AND EXIT CLEANLY #############################################
     $lock->unlock();
     exit(0);
 }
 
-
-
-#validate options{var}.
-## Is the var directory valid?
-## Was there a prior run against the specified path?
-
-# ${var}/antirot/ exists and is writeable.
-# Path exists and is a directory and we have a filehandle to it.
 
 sub convert_to_seconds {
     my $user_time = lc(shift); # 'i' option to regex does not work when utilizing [] so we must convert here. 
@@ -109,8 +137,202 @@ sub verify_path {
         chdir($original_pwd);
     }
     return $verified_path;
-    
 }
+
+package Fusco::Checksum;
+
+use Digest::MD5;
+use Tie::File;
+use File::Find;
+
+sub new {
+    my $class   = shift;
+    my $options = shift;
+
+    my $self = {
+        db          => undef,
+        file_path   => $$options{path},
+        file_age    => $$options{age},
+        db_dir      => $$options{var} . '_current',
+        db_dir_old  => $$options{var} . '_old',
+        db_dir_scan => $$options{var} . '_scan',
+        db_dir_new  => $$options{var} . '_new'
+    };
+
+    return bless $self, $class;
+}
+
+sub scan {
+    my $self = shift;
+    my $file_path = $$self{file_path};
+    
+    
+    my @tie_scan;
+    tie @tie_scan, 'Tie::File', $$self{db_dir_scan};
+
+    undef @tie_scan;
+
+    my $md5_scan = $self->generate_md5_scan(\@tie_scan);
+
+    find({
+        wanted => $md5_scan,
+        no_chdir => 1,
+    }, $file_path);
+
+    untie(@$tie_scan);
+    
+    return 1;
+}
+
+sub generate_md5_scan {
+    my $self       = shift;
+    my $tied_array = shift;
+    
+    my $current_time = time;
+    my $file_age_timestamp = $current_time - $$self{file_age};
+
+    return sub {
+        if(-d $_) {
+            return undef;
+        }
+        if(-p $_) {
+            return undef;
+        }
+        my @stat = lstat($_);
+        
+        unless($stat[9] < $file_age_timestamp) {
+             return;
+        }       
+
+        unless(open($file, '<', $_)) {
+            warn "Can't open '$_':$!";
+            return undef;
+        }
+        binmode($file);
+        
+        my $md5 = Digest::MD5->new->addfile($file)->hexdigest;
+
+        # Joining on ':' should be ctrl character to ensure no file collision. 
+        # Future will probably bring some type of DB implementation.
+        push(@$tied_array, join(':', $_, $stat[9],  $md5));
+    };
+}
+
+
+sub mismatched_checksum {
+    my $self = shift;
+
+    my @scan;
+    my @current;
+    my @new;
+    
+    tie @scan, 'Tie::File', $$self{db_dir_scan};
+    tie @current, 'Tie::File', $$self{db_dir};
+    tie @new, 'Tie::File', $$self{db_dir_new};
+
+    print_memory_usage();
+
+    my $scan = $self->get_hash_dir_struct(\@scan);
+    my $current = $self->get_hash_dir_struct(\@current);
+    
+    # $scan takes all unscaned data from $current.
+    merge_and_compare($scan, $current);
+    
+    
+    use Data::Dumper;
+    
+    print Dumper($current);
+    
+    print_memory_usage();
+
+    untie(@scan);
+    untie(@current);
+    untie(@new);
+
+    return 'no mismatch';
+}
+
+sub merge_and_compare {
+    my $scan    = shift;
+    my $current = shift;
+
+    compare_and_delete_from_current($scan, $current);
+
+#    merge_from_current($current, $scan);
+
+    return 1;
+}
+
+sub compare_and_delete_from_current{
+    my ($scan, $current) = @_;
+
+    my %dirs;
+    
+    for my $dir (keys %$scan) {
+        # Call self with hash refs to the Nth level dir.
+        next if($$scan{$dir}{mtime});
+
+        compare_and_delete_from_current($$scan{$dir}, $$current{$dir});
+
+
+        next if($dir eq '/');
+                print "Deleting $dir\n";
+        delete($$current{$dir});
+        $dirs{$dir} = 1;
+
+    }
+
+
+    # All directories have been processed and masked via the %dirs hash.
+    for my $file (keys %$scan) {
+
+        next if($dirs{$file});   # We know this is a dir from the for loop above.
+                    
+        my $mtime = $$scan{$file}{mtime}; 
+        my $md5   = $$scan{$file}{md5};
+
+        next unless($$current{$file}{mtime} == $$scan{$file}{mtime});
+        
+        if($$current{$file}{md5} ne $$scan{$file}{md5}) {
+            $$scan{$file}{md5_original} = $$current{$file}{md5};
+        }
+    }
+
+};
+
+
+
+sub get_hash_dir_struct {
+    my $self = shift;
+    my $checksum_file = shift;
+
+    my %dir;
+    
+    for my $file (@$checksum_file) {
+        chomp($file);
+        my ($path, $mtime, $md5) = split(/:/, $file);
+        my @path = split(/\//, $path);
+        $path[0] = '/';
+
+        my $path_hash = join('\'}{\'', @path);
+        $path_hash = "\$dir\{\'$path_hash\'\} = {mtime => $mtime, md5 => \'$md5\' }  ";
+        
+        eval $path_hash;   
+    }
+    return \%dir;
+}
+
+
+
+sub print_memory_usage {
+    my @status = `cat /proc/$$/status`;
+    print grep { /VmSize/ } @status;
+    
+    print"\n";
+    
+    return 1;
+}
+
 
 
 package Fusco::Lock;
@@ -296,7 +518,7 @@ sub write_pid_to_file {
     my $lockfile = shift;
     
     my $pid = $$;
-        
+
     open(LOCKFILE, ">$lockfile") or return $self->_return_error("Can't write to $lockfile: $!");
     print LOCKFILE $pid;
     close(LOCKFILE);
